@@ -4,9 +4,9 @@ import tensorflow as tf
 from layers import (_causal_linear, _output_linear, conv1d,
                     dilated_conv1d)
 
-def average_pooling(x,ds_rate):
-    return tf.nn.avg_pool(x, ksize=[1, 1, 160, 1],
-                        strides=[1, 1, 160, 1], padding='SAME')
+def average_pooling(x,ds_rate=160):
+    return tf.nn.avg_pool(x, ksize=[1, 1, ds_rate, 1],
+                        strides=[1, 1, ds_rate, 1], padding='SAME')
 def full_weight(name, shape):
     return tf.get_variable(name,shape = shape, initializer=tf.contrib.layers.xavier_initializer(uniform = False))
 
@@ -21,10 +21,9 @@ class Model(object):
                  num_time_samples,
                  num_channels=1,
                  num_classes_value=256,
-                 num_blocks=4,
-                 num_layers=12,
+                 num_blocks=2,
+                 num_layers=14,
                  num_hidden=128,
-                 gpu_fraction=6.1,
                  num_classes = 109):
 
         self.num_time_samples = num_time_samples
@@ -34,7 +33,6 @@ class Model(object):
         self.num_blocks = num_blocks
         self.num_layers = num_layers
         self.num_hidden = num_hidden
-        self.gpu_fraction = gpu_fraction
 
         inputs = tf.placeholder(tf.float32,
                                 shape=(None, num_time_samples, num_channels))
@@ -51,9 +49,19 @@ class Model(object):
                 h = dilated_conv1d(h, num_hidden, rate=rate, name=name)
                 hs.append(h)
 
+        with tf.variable_scope('prediction_layer'):
+            outputs_pred = conv1d(h,
+                             num_classes_value,
+                             filter_width=1,
+                             gain=1.0,
+                             activation=None,
+                             bias=True)
+
+        cost_pred = tf.nn.sparse_softmax_cross_entropy_with_logits(outputs_pred, targets_pred)
+
         with tf.variable_scope('average_pooling'):
             h_reshape = tf.expand_dims(h, 1)
-            output_ap_res = average_pooling(h_reshape,ds_rate = 160)
+            output_ap_res = average_pooling(h_reshape,ds_rate = 20)
             shape = output_ap_res.get_shape().as_list()
             output_ap = tf.reshape(output_ap_res,[b_size,shape[2],shape[3]])
         with tf.variable_scope('non_causal_convolution'):
@@ -82,36 +90,27 @@ class Model(object):
 
                 class_w = full_weight('w_cl', [size_final_layer,class_num])
                 class_b = bias_variable('b_fc1', [class_num])
-                class_fc = tf.matmul(output_class_resh, class_w) + class_b
-                output_class = tf.nn.softmax(class_fc)
-            with tf.variable_scope('prediction_layer'):
-                outputs_pred = conv1d(h,
-                                 num_classes_value,
-                                 filter_width=1,
-                                 gain=1.0,
-                                 activation=None,
-                                 bias=True)
+                output_class = tf.matmul(output_class_resh, class_w) + class_b
 
-        cost_pred = tf.nn.sparse_softmax_cross_entropy_with_logits(outputs_pred, targets_pred)
 
-        cost_class = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(targets_class, output_class))
+        cost_class = tf.nn.softmax_cross_entropy_with_logits(output_class, targets_class)
 
-        alpha = 0.7
-        beta = 0.3
+        alpha = 0.9
+        beta = 0.1
 
         cost = alpha * tf.reduce_mean(cost_pred) + beta * tf.reduce_mean(cost_class)
+        # cost =  tf.reduce_mean(cost_pred)
 
-        train_step = tf.train.AdamOptimizer(learning_rate=0.001).minimize(cost)
+        train_step = tf.train.AdamOptimizer(learning_rate=0.0001).minimize(cost)
 
-        gpu_options = tf.GPUOptions(
-            per_process_gpu_memory_fraction=gpu_fraction)
-        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+
+        sess = tf.Session(config=tf.ConfigProto())
         sess.run(tf.initialize_all_variables())
 
         self.inputs = inputs
         self.targets_pred = targets_pred
         self.targets_class = targets_class
-        self.outputs = outputs
+        self.outputs_pred = outputs_pred
         self.hs = hs
         self.cost_pred = cost_pred
         self.cost_class = cost_class
@@ -119,98 +118,13 @@ class Model(object):
         self.train_step = train_step
         self.sess = sess
 
-    def _train(self, inputs, targets_pred, targets_class):
+
+    def train(self, inputs, targets_pred, targets_class,print_b = False):
         feed_dict = {self.inputs: inputs, self.targets_pred: targets_pred, self.targets_class: targets_class}
         cost, _ = self.sess.run(
             [self.cost, self.train_step],
             feed_dict=feed_dict)
-        return cost
-
-    def train(self, inputs, targets_pred, target_class):
-        losses = []
-        terminal = False
-        i = 0
-        while not terminal:
-            i += 1
-            cost = self._train(inputs, targets_pred, target_class)
+        if np.isnan(cost): import ipdb; ipdb.set_trace()
+        if print_b:
             print 'cost value : {}'.format(cost)
-            if cost < 1e-1:
-                terminal = True
-            losses.append(cost)
-            if i % 50 == 0:
-                plt.plot(losses)
-                plt.show()
 
-
-class Generator(object):
-    def __init__(self, model, batch_size=1, input_size=1):
-        self.model = model
-        self.bins = np.linspace(-1, 1, self.model.num_classes)
-
-        inputs = tf.placeholder(tf.float32, [batch_size, input_size],
-                                name='inputs')
-
-        print('Make Generator.')
-
-        count = 0
-        h = inputs
-
-        init_ops = []
-        push_ops = []
-        for b in range(self.model.num_blocks):
-            for i in range(self.model.num_layers):
-                rate = 2 ** i
-                name = 'b{}-l{}'.format(b, i)
-                if count == 0:
-                    state_size = 1
-                else:
-                    state_size = self.model.num_hidden
-
-                q = tf.FIFOQueue(rate,
-                                 dtypes=tf.float32,
-                                 shapes=(batch_size, state_size))
-                init = q.enqueue_many(tf.zeros((rate, batch_size, state_size)))
-
-                state_ = q.dequeue()
-                push = q.enqueue([h])
-                init_ops.append(init)
-                push_ops.append(push)
-
-                h = _causal_linear(h, state_, name=name, activation=tf.nn.relu)
-                count += 1
-
-        outputs = _output_linear(h)
-
-        out_ops = [tf.nn.softmax(outputs)]
-        out_ops.extend(push_ops)
-
-        self.inputs = inputs
-        self.init_ops = init_ops
-        self.out_ops = out_ops
-
-        # Initialize queues.
-        self.model.sess.run(self.init_ops)
-
-    def run(self, input, num_samples):
-        predictions = []
-        for step in range(num_samples):
-
-            feed_dict = {self.inputs: input}
-            output = self.model.sess.run(self.out_ops, feed_dict=feed_dict)[0]  # ignore push ops
-            value = np.argmax(output[0, :])
-
-            input = np.array(self.bins[value])[None, None]
-            predictions.append(input)
-
-            if step % 1000 == 0:
-                predictions_ = np.concatenate(predictions, axis=1)
-                plt.plot(predictions_[0, :], label='pred')
-                plt.legend()
-                plt.xlabel('samples from start')
-                plt.ylabel('signal')
-                plt.show()
-
-        predictions_ = np.concatenate(predictions, axis=1)
-
-
-        return predictions_
